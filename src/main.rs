@@ -21,6 +21,62 @@ use serde_json::{json, Value};
 use std::io::Write;
 use usb::UsbDev;
 
+/// 输出契约版本。字段结构变更时 +1,agent 可据此检测契约。
+const SCHEMA_VERSION: u32 = 1;
+/// 写后校验最大读回字节数,超过则跳过校验(避免大分区占满内存)。
+const VERIFY_MAX: u64 = 256 * 1024 * 1024;
+
+/// 带错误码的业务错误,顶层据此产出结构化 error_code/hint/details。
+#[derive(Debug)]
+struct Coded {
+    code: &'static str,
+    msg: String,
+    hint: Option<String>,
+    details: Option<Value>,
+}
+impl std::fmt::Display for Coded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.msg)
+    }
+}
+impl std::error::Error for Coded {}
+
+fn coded(code: &'static str, msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Coded { code, msg: msg.into(), hint: None, details: None })
+}
+fn coded_details(
+    code: &'static str,
+    msg: impl Into<String>,
+    hint: Option<String>,
+    details: Value,
+) -> anyhow::Error {
+    anyhow::Error::new(Coded { code, msg: msg.into(), hint, details: Some(details) })
+}
+
+/// 把 anyhow 错误归类成 (error_code, hint, details)。优先 Coded,否则按消息关键字兜底。
+fn classify(err: &anyhow::Error) -> (&'static str, Option<String>, Option<Value>) {
+    if let Some(c) = err.downcast_ref::<Coded>() {
+        return (c.code, c.hint.clone(), c.details.clone());
+    }
+    let m = format!("{err:#}");
+    let code = if m.contains("未找到 EDL 设备") {
+        "DEVICE_NOT_FOUND"
+    } else if m.contains("claim") || m.contains("权限") || m.contains("打开") {
+        "USB_ACCESS"
+    } else if m.contains("签名") || m.contains("END_TRANSFER") {
+        "LOADER_REJECTED"
+    } else if m.contains("已经被 Magisk") {
+        "ALREADY_PATCHED"
+    } else if m.contains("被拒") || m.contains("非 ACK") {
+        "FIREHOSE_NAK"
+    } else if m.contains("超时") {
+        "TIMEOUT"
+    } else {
+        "ERROR"
+    };
+    (code, None, None)
+}
+
 /// 高通 9008 EDL 工具(Rust)。
 #[derive(Parser)]
 #[command(name = "qedl", version, about = "Qualcomm 9008 EDL (Sahara+Firehose) · 原生 Mac 二进制")]
@@ -83,26 +139,44 @@ enum Cmd {
         sectors: u64,
         out: String,
     },
-    /// 按分区名把文件写入(program)
+    /// 按分区名把文件写入(program)。破坏性:默认需 --yes
     Write {
         partition: String,
         input: String,
+        /// 确认执行(否则只返回影响评估,不写)
+        #[arg(long)]
+        yes: bool,
+        /// 不自动备份原分区
+        #[arg(long)]
+        no_backup: bool,
     },
-    /// 按 lun/起始扇区把文件写入
+    /// 按 lun/起始扇区把文件写入。破坏性:默认需 --yes
     WriteLun {
         lun: u32,
         start: u64,
         input: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        no_backup: bool,
     },
-    /// 按分区名擦除
+    /// 按分区名擦除。破坏性:默认需 --yes
     Erase {
         partition: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        no_backup: bool,
     },
-    /// 按 lun/起始扇区/扇区数擦除
+    /// 按 lun/起始扇区/扇区数擦除。破坏性:默认需 --yes
     EraseLun {
         lun: u32,
         start: u64,
         sectors: u64,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        no_backup: bool,
     },
     /// 读内存
     Peek {
@@ -225,18 +299,31 @@ fn main() {
     let cli = Cli::parse();
     let json_mode = cli.json;
     match run(&cli) {
-        Ok(v) => {
+        Ok(data) => {
             if json_mode {
+                let v = json!({"ok": true, "schema_version": SCHEMA_VERSION, "data": data});
                 println!("{}", serde_json::to_string_pretty(&v).unwrap());
             }
             std::process::exit(0);
         }
         Err(e) => {
+            let (code, hint, details) = classify(&e);
             if json_mode {
-                let v = json!({"ok": false, "error": format!("{e:#}")});
+                let mut v = json!({
+                    "ok": false,
+                    "schema_version": SCHEMA_VERSION,
+                    "error_code": code,
+                    "error": format!("{e:#}"),
+                });
+                if let Some(h) = hint {
+                    v["hint"] = json!(h);
+                }
+                if let Some(d) = details {
+                    v["details"] = d;
+                }
                 println!("{}", serde_json::to_string_pretty(&v).unwrap());
             } else {
-                eprintln!("错误: {e:#}");
+                eprintln!("错误[{code}]: {e:#}");
             }
             std::process::exit(1);
         }
@@ -292,8 +379,8 @@ fn load_loader(cli: &Cli) -> Result<Vec<u8>> {
     let path = cli
         .loader
         .as_deref()
-        .context("该命令需要 --loader <firehose loader 路径>")?;
-    std::fs::read(path).with_context(|| format!("读取 loader {path} 失败"))
+        .ok_or_else(|| coded("LOADER_MISSING", "该命令需要 --loader <firehose loader 路径>"))?;
+    std::fs::read(path).map_err(|e| coded("LOADER_MISSING", format!("读取 loader {path} 失败: {e}")))
 }
 
 /// 完成 sahara 上传 + firehose 初始化,返回就绪的 Firehose。
@@ -352,11 +439,11 @@ fn run(cli: &Cli) -> Result<Value> {
             match found {
                 Some((v, p)) => {
                     log!("找到设备 {:04x}:{:04x}", v, p);
-                    Ok(json!({"ok": true, "present": true, "vid": format!("{:04x}", v), "pid": format!("{:04x}", p)}))
+                    Ok(json!({"present": true, "vid": format!("{:04x}", v), "pid": format!("{:04x}", p)}))
                 }
                 None => {
                     log!("未找到 EDL 设备");
-                    Ok(json!({"ok": true, "present": false}))
+                    Ok(json!({"present": false}))
                 }
             }
         }
@@ -374,7 +461,6 @@ fn run(cli: &Cli) -> Result<Value> {
             log!("serial={:?} hwid={:?} pkhash={:?}", serial, hwid, info.pkhash);
             let _ = sah.cmd_reset();
             Ok(json!({
-                "ok": true,
                 "serial": serial,
                 "msm_hwid": hwid,
                 "pkhash": info.pkhash,
@@ -386,7 +472,6 @@ fn run(cli: &Cli) -> Result<Value> {
             let mut fh = start_firehose(&usb, cli)?;
             let logs = fh.get_storage_info()?;
             Ok(json!({
-                "ok": true,
                 "memory": fh.cfg.memory_name,
                 "sector_size": fh.cfg.sector_size,
                 "block_size": fh.cfg.block_size,
@@ -430,19 +515,17 @@ fn run(cli: &Cli) -> Result<Value> {
                     );
                 }
             }
-            Ok(json!({"ok": true, "sector_size": ss, "partitions": parts}))
+            Ok(json!({"sector_size": ss, "partitions": parts}))
         }
 
         Cmd::Read { partition, out } => {
             let usb = open_usb(cli)?;
             let fh = start_firehose(&usb, cli)?;
-            let (lun, start, sectors) = fh
-                .find_partition(partition)
-                .with_context(|| format!("未找到分区 {partition}"))?;
+            let (lun, start, sectors) = find_part(&fh, partition)?;
             log!("读取 {partition} (lun={lun} start={start} sectors={sectors}) -> {out}");
             let n = fh.read_to_file(lun, start, sectors, out)?;
             log!("完成,写入 {} 字节", n);
-            Ok(json!({"ok": true, "partition": partition, "lun": lun, "start_sector": start, "num_sectors": sectors, "bytes": n, "out": out}))
+            Ok(json!({"partition": partition, "lun": lun, "start_sector": start, "num_sectors": sectors, "bytes": n, "out": out}))
         }
 
         Cmd::ReadLun { lun, start, sectors, out } => {
@@ -451,52 +534,33 @@ fn run(cli: &Cli) -> Result<Value> {
             log!("读取 lun={lun} start={start} sectors={sectors} -> {out}");
             let n = fh.read_to_file(*lun, *start, *sectors, out)?;
             log!("完成,写入 {} 字节", n);
-            Ok(json!({"ok": true, "lun": lun, "start_sector": start, "num_sectors": sectors, "bytes": n, "out": out}))
+            Ok(json!({"lun": lun, "start_sector": start, "num_sectors": sectors, "bytes": n, "out": out}))
         }
 
-        Cmd::Write { partition, input } => {
+        Cmd::Write { partition, input, yes, no_backup } => {
             let usb = open_usb(cli)?;
             let fh = start_firehose(&usb, cli)?;
-            let (lun, start, sectors) = fh
-                .find_partition(partition)
-                .with_context(|| format!("未找到分区 {partition}"))?;
-            let fsize = std::fs::metadata(input)?.len();
-            let cap = sectors * fh.cfg.sector_size as u64;
-            if fsize > cap {
-                bail!("输入文件 {} 字节 > 分区容量 {} 字节", fsize, cap);
-            }
-            log!("写入 {input} -> {partition} (lun={lun} start={start})");
-            let n = fh.program_file(lun, start, input)?;
-            log!("完成,写入 {} 字节", n);
-            Ok(json!({"ok": true, "partition": partition, "lun": lun, "start_sector": start, "bytes": n, "input": input}))
+            let (lun, start, sectors) = find_part(&fh, partition)?;
+            write_guarded(&fh, Some(partition.as_str()), lun, start, Some(sectors), input, *yes, *no_backup)
         }
 
-        Cmd::WriteLun { lun, start, input } => {
+        Cmd::WriteLun { lun, start, input, yes, no_backup } => {
             let usb = open_usb(cli)?;
             let fh = start_firehose(&usb, cli)?;
-            log!("写入 {input} -> lun={lun} start={start}");
-            let n = fh.program_file(*lun, *start, input)?;
-            log!("完成,写入 {} 字节", n);
-            Ok(json!({"ok": true, "lun": lun, "start_sector": start, "bytes": n, "input": input}))
+            write_guarded(&fh, None, *lun, *start, None, input, *yes, *no_backup)
         }
 
-        Cmd::Erase { partition } => {
+        Cmd::Erase { partition, yes, no_backup } => {
             let usb = open_usb(cli)?;
             let fh = start_firehose(&usb, cli)?;
-            let (lun, start, sectors) = fh
-                .find_partition(partition)
-                .with_context(|| format!("未找到分区 {partition}"))?;
-            log!("擦除 {partition} (lun={lun} start={start} sectors={sectors})");
-            fh.erase(lun, start, sectors)?;
-            Ok(json!({"ok": true, "partition": partition, "lun": lun, "start_sector": start, "num_sectors": sectors}))
+            let (lun, start, sectors) = find_part(&fh, partition)?;
+            erase_guarded(&fh, Some(partition.as_str()), lun, start, sectors, *yes, *no_backup)
         }
 
-        Cmd::EraseLun { lun, start, sectors } => {
+        Cmd::EraseLun { lun, start, sectors, yes, no_backup } => {
             let usb = open_usb(cli)?;
             let fh = start_firehose(&usb, cli)?;
-            log!("擦除 lun={lun} start={start} sectors={sectors}");
-            fh.erase(*lun, *start, *sectors)?;
-            Ok(json!({"ok": true, "lun": lun, "start_sector": start, "num_sectors": sectors}))
+            erase_guarded(&fh, None, *lun, *start, *sectors, *yes, *no_backup)
         }
 
         Cmd::Peek { address, size, out } => {
@@ -507,13 +571,13 @@ fn run(cli: &Cli) -> Result<Value> {
             if let Some(path) = out {
                 std::fs::write(path, &data)?;
                 log!("peek {} 字节 -> {}", data.len(), path);
-                Ok(json!({"ok": true, "address": format!("0x{:x}", addr), "bytes": data.len(), "out": path}))
+                Ok(json!({"address": format!("0x{:x}", addr), "bytes": data.len(), "out": path}))
             } else {
                 let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
                 if !cli.json {
                     log!("{}", hex);
                 }
-                Ok(json!({"ok": true, "address": format!("0x{:x}", addr), "bytes": data.len(), "hex": hex}))
+                Ok(json!({"address": format!("0x{:x}", addr), "bytes": data.len(), "hex": hex}))
             }
         }
 
@@ -524,7 +588,7 @@ fn run(cli: &Cli) -> Result<Value> {
             let bytes = decode_hex_cli(hex)?;
             fh.poke(addr, &bytes)?;
             log!("poke {} 字节 @ 0x{:x}", bytes.len(), addr);
-            Ok(json!({"ok": true, "address": format!("0x{:x}", addr), "bytes": bytes.len()}))
+            Ok(json!({"address": format!("0x{:x}", addr), "bytes": bytes.len()}))
         }
 
         Cmd::Reset { mode } => {
@@ -532,7 +596,7 @@ fn run(cli: &Cli) -> Result<Value> {
             let fh = start_firehose(&usb, cli)?;
             log!("复位: {mode}");
             fh.reset(mode)?;
-            Ok(json!({"ok": true, "mode": mode}))
+            Ok(json!({"mode": mode}))
         }
 
         Cmd::Boot { sub } => run_boot(sub, cli.json),
@@ -548,7 +612,7 @@ fn run_magisk(sub: &MagiskCmd) -> Result<Value> {
             let (ver, code) = magisk::version(&mut a);
             let archs = magisk::list_archs(&mut a);
             log!("Magisk {} (code {}) archs={}", ver.clone().unwrap_or("?".into()), code.clone().unwrap_or("?".into()), archs.join(","));
-            Ok(json!({"ok": true, "version": ver, "version_code": code, "archs": archs}))
+            Ok(json!({"version": ver, "version_code": code, "archs": archs}))
         }
         MagiskCmd::Extract { apk, outdir, arch } => {
             let mut a = magisk::open_apk(apk)?;
@@ -565,7 +629,7 @@ fn run_magisk(sub: &MagiskCmd) -> Result<Value> {
             }
             log!("解出到 {outdir}/(abi={}, magiskinit {} 字节, magisk.xz {} 字节)", res.arch, res.magiskinit.len(), res.magisk_xz.len());
             Ok(json!({
-                "ok": true, "outdir": outdir, "abi": res.arch,
+                "outdir": outdir, "abi": res.arch,
                 "magiskinit": res.magiskinit.len(), "magisk_xz": res.magisk_xz.len(),
                 "stub_xz": res.stub_xz.as_ref().map(|v| v.len()),
                 "init_ld_xz": res.initld_xz.as_ref().map(|v| v.len()),
@@ -589,7 +653,7 @@ fn run_magisk(sub: &MagiskCmd) -> Result<Value> {
             std::fs::write(out, &patched).with_context(|| format!("写入 {out} 失败"))?;
             log!("完成: {out}({} 字节)。刷回前务必先备份原 boot!", patched.len());
             Ok(json!({
-                "ok": true, "out": out, "bytes": patched.len(),
+                "out": out, "bytes": patched.len(),
                 "magisk_version": ver, "abi": res.arch,
                 "keep_verity": opts.keep_verity, "keep_forceencrypt": opts.keep_forceencrypt, "recovery": opts.recovery,
             }))
@@ -614,7 +678,6 @@ fn run_boot(sub: &BootCmd, json_mode: bool) -> Result<Value> {
                 b.dtb.len()
             );
             Ok(json!({
-                "ok": true,
                 "version": b.version,
                 "page_size": b.page_size,
                 "kernel_size": b.kernel.len(),
@@ -641,7 +704,7 @@ fn run_boot(sub: &BootCmd, json_mode: bool) -> Result<Value> {
                 b.ramdisk.len()
             );
             Ok(json!({
-                "ok": true, "outdir": dir, "version": b.version,
+                "outdir": dir, "version": b.version,
                 "ramdisk_format": b.ramdisk_fmt.name(),
                 "files": ["header.bin","ramdisk_fmt","kernel","ramdisk.cpio"],
             }))
@@ -651,7 +714,7 @@ fn run_boot(sub: &BootCmd, json_mode: bool) -> Result<Value> {
             let img = bootimg::repack_from_dir(std::path::Path::new(dir))?;
             std::fs::write(out, &img).with_context(|| format!("写入 {out} 失败"))?;
             log!("重打包完成: {out}({} 字节)", img.len());
-            Ok(json!({"ok": true, "out": out, "bytes": img.len()}))
+            Ok(json!({"out": out, "bytes": img.len()}))
         }
 
         BootCmd::Cpio { sub } => run_cpio(sub, json_mode),
@@ -685,7 +748,7 @@ fn run_cpio(sub: &CpioCmd, _json_mode: bool) -> Result<Value> {
                     "size": e.data.len(), "symlink": target,
                 }));
             }
-            Ok(json!({"ok": true, "count": list.len(), "entries": list}))
+            Ok(json!({"count": list.len(), "entries": list}))
         }
 
         CpioCmd::Extract { file, entry, out } => {
@@ -700,7 +763,7 @@ fn run_cpio(sub: &CpioCmd, _json_mode: bool) -> Result<Value> {
                         .with_context(|| format!("cpio 内无条目 {name}"))?;
                     std::fs::write(o, &ent.data)?;
                     log!("提取 {name} -> {o}({} 字节)", ent.data.len());
-                    Ok(json!({"ok": true, "entry": name, "out": o, "bytes": ent.data.len()}))
+                    Ok(json!({"entry": name, "out": o, "bytes": ent.data.len()}))
                 }
                 _ => {
                     let dir = out.clone().unwrap_or_else(|| format!("{file}.extracted"));
@@ -717,7 +780,7 @@ fn run_cpio(sub: &CpioCmd, _json_mode: bool) -> Result<Value> {
                         }
                     }
                     log!("提取 {n} 个文件到 {dir}/");
-                    Ok(json!({"ok": true, "outdir": dir, "files": n}))
+                    Ok(json!({"outdir": dir, "files": n}))
                 }
             }
         }
@@ -731,7 +794,7 @@ fn run_cpio(sub: &CpioCmd, _json_mode: bool) -> Result<Value> {
             c.add_file(m, entry, content);
             std::fs::write(file, c.serialize())?;
             log!("添加 {entry}(mode {mode}, {sz} 字节)写回 {file}");
-            Ok(json!({"ok": true, "entry": entry, "bytes": sz}))
+            Ok(json!({"entry": entry, "bytes": sz}))
         }
 
         CpioCmd::Rm { file, entry, recursive } => {
@@ -740,7 +803,7 @@ fn run_cpio(sub: &CpioCmd, _json_mode: bool) -> Result<Value> {
             c.rm(entry, *recursive);
             std::fs::write(file, c.serialize())?;
             log!("删除 {entry}{}写回 {file}", if *recursive { "(递归)" } else { "" });
-            Ok(json!({"ok": true, "entry": entry}))
+            Ok(json!({"entry": entry}))
         }
 
         CpioCmd::Mkdir { file, mode, entry } => {
@@ -750,7 +813,7 @@ fn run_cpio(sub: &CpioCmd, _json_mode: bool) -> Result<Value> {
             c.mkdir(m, entry);
             std::fs::write(file, c.serialize())?;
             log!("新建目录 {entry}(mode {mode})写回 {file}");
-            Ok(json!({"ok": true, "entry": entry}))
+            Ok(json!({"entry": entry}))
         }
     }
 }
@@ -770,6 +833,177 @@ fn read_cmdline(b: &bootimg::BootImg) -> String {
     let raw = &b.header_page[off..off + len];
     let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
     String::from_utf8_lossy(&raw[..end]).into_owned()
+}
+
+/// 按分区名定位,未找到时给 PARTITION_NOT_FOUND。
+fn find_part(fh: &Firehose, name: &str) -> Result<(u32, u64, u64)> {
+    fh.find_partition(name).ok_or_else(|| {
+        coded_details(
+            "PARTITION_NOT_FOUND",
+            format!("未找到分区 {name}"),
+            Some("用 printgpt 查看可用分区名".into()),
+            json!({ "partition": name }),
+        )
+    })
+}
+
+/// 粗略风险分级,供影响评估。
+fn risk_of(name: Option<&str>, lun: u32) -> &'static str {
+    let n = name.unwrap_or("").to_lowercase();
+    let high = [
+        "xbl", "abl", "sbl", "gpt", "bootloader", "devcfg", "tz", "hyp", "rpm", "keymaster",
+        "cmnlib", "uefi", "pmic", "aop", "qupfw", "multiimg", "storsec", "devinfo",
+    ];
+    let med = ["boot", "init_boot", "recovery", "vbmeta", "dtbo", "modem", "super", "dsp"];
+    if high.iter().any(|k| n.contains(k)) {
+        return "high";
+    }
+    if name.is_none() && (lun == 1 || lun == 2) {
+        return "high"; // xbl 所在 LUN
+    }
+    if med.iter().any(|k| n.contains(k)) {
+        return "medium";
+    }
+    "low"
+}
+
+fn backup_name(name: Option<&str>, lun: u32, start: u64) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let who = name.map(|s| s.to_string()).unwrap_or_else(|| format!("lun{lun}-s{start}"));
+    let safe: String = who
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    format!("qedl-backup-{safe}-{ts}.img")
+}
+
+/// 带护栏的写入:无 --yes 返回 NEEDS_CONFIRM+影响评估;有则自动备份→写→回读校验。
+#[allow(clippy::too_many_arguments)]
+fn write_guarded(
+    fh: &Firehose,
+    part_name: Option<&str>,
+    lun: u32,
+    start: u64,
+    cap_sectors: Option<u64>,
+    input: &str,
+    yes: bool,
+    no_backup: bool,
+) -> Result<Value> {
+    let sector = fh.cfg.sector_size as u64;
+    let fsize = std::fs::metadata(input)
+        .map_err(|e| coded("INPUT_ERROR", format!("读取 {input} 失败: {e}")))?
+        .len();
+    let write_sectors = fsize.div_ceil(sector);
+    if let Some(cap) = cap_sectors {
+        if fsize > cap * sector {
+            return Err(coded_details(
+                "FILE_TOO_LARGE",
+                format!("输入 {fsize} 字节 > 分区容量 {} 字节", cap * sector),
+                None,
+                json!({ "file_bytes": fsize, "capacity_bytes": cap * sector }),
+            ));
+        }
+    }
+    let risk = risk_of(part_name, lun);
+    let impact = json!({
+        "op": "write", "partition": part_name, "lun": lun, "start_sector": start,
+        "write_sectors": write_sectors, "bytes": fsize, "risk": risk, "input": input,
+    });
+    if !yes {
+        return Err(coded_details(
+            "NEEDS_CONFIRM",
+            "破坏性写入已拦截(未加 --yes)",
+            Some("确认影响评估后,加 --yes 重新执行".into()),
+            json!({ "impact": impact }),
+        ));
+    }
+
+    let backup_path = if !no_backup {
+        let bs = cap_sectors.unwrap_or(write_sectors);
+        let p = backup_name(part_name, lun, start);
+        log!("备份原分区({bs} 扇区)-> {p}");
+        fh.read_to_file(lun, start, bs, &p)?;
+        Some(p)
+    } else {
+        None
+    };
+
+    log!("写入 {input} -> lun={lun} start={start}({write_sectors} 扇区)");
+    let n = fh.program_file(lun, start, input)?;
+
+    let total = write_sectors * sector;
+    let verified = if total <= VERIFY_MAX {
+        let mut expect = std::fs::read(input)?;
+        expect.resize(total as usize, 0);
+        let actual = fh.read_buffer(lun, start, write_sectors)?;
+        Some(actual == expect)
+    } else {
+        None
+    };
+    if verified == Some(false) {
+        return Err(coded_details(
+            "VERIFY_FAILED",
+            "写后回读校验不一致!",
+            Some("设备数据与输入不符,先别重启;可用 backup_path 回滚后重试".into()),
+            json!({ "backup_path": backup_path, "lun": lun, "start_sector": start }),
+        ));
+    }
+    log!("完成,写入 {n} 字节,校验={verified:?}");
+    Ok(json!({
+        "op": "write", "partition": part_name, "lun": lun, "start_sector": start,
+        "bytes": n, "input": input, "backup_path": backup_path, "verified": verified,
+    }))
+}
+
+/// 带护栏的擦除。
+#[allow(clippy::too_many_arguments)]
+fn erase_guarded(
+    fh: &Firehose,
+    part_name: Option<&str>,
+    lun: u32,
+    start: u64,
+    sectors: u64,
+    yes: bool,
+    no_backup: bool,
+) -> Result<Value> {
+    let sector = fh.cfg.sector_size as u64;
+    let total = sectors * sector;
+    let risk = risk_of(part_name, lun);
+    let impact = json!({
+        "op": "erase", "partition": part_name, "lun": lun, "start_sector": start,
+        "num_sectors": sectors, "bytes": total, "risk": risk,
+    });
+    if !yes {
+        return Err(coded_details(
+            "NEEDS_CONFIRM",
+            "破坏性擦除已拦截(未加 --yes)",
+            Some("确认影响评估后,加 --yes 重新执行".into()),
+            json!({ "impact": impact }),
+        ));
+    }
+    let backup_path = if !no_backup {
+        let p = backup_name(part_name, lun, start);
+        log!("备份原分区({sectors} 扇区)-> {p}");
+        fh.read_to_file(lun, start, sectors, &p)?;
+        Some(p)
+    } else {
+        None
+    };
+    log!("擦除 lun={lun} start={start} sectors={sectors}");
+    fh.erase(lun, start, sectors)?;
+    let verified_all_zero = if total <= VERIFY_MAX {
+        let actual = fh.read_buffer(lun, start, sectors)?;
+        Some(actual.iter().all(|&b| b == 0))
+    } else {
+        None
+    };
+    Ok(json!({
+        "op": "erase", "partition": part_name, "lun": lun, "start_sector": start,
+        "num_sectors": sectors, "backup_path": backup_path, "verified_all_zero": verified_all_zero,
+    }))
 }
 
 fn human(bytes: u64) -> String {

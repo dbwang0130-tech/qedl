@@ -37,6 +37,32 @@ qedl -l $L poke 0x200000 0101             # 写内存
 qedl -l $L reset reset                    # 重启(reset / edl / off)
 ```
 
+## 面向 agent 的输出契约
+
+`--json` 下 stdout 永远是一个对象:
+
+```jsonc
+// 成功
+{ "ok": true, "schema_version": 1, "data": { ... } }
+// 失败
+{ "ok": false, "schema_version": 1, "error_code": "...", "error": "...",
+  "hint": "...(可选)", "details": { ...(可选) } }
+```
+
+- 日志走 stderr,stdout 只有这一个 JSON;退出码 0=成功,非 0=失败。
+- `error_code` 枚举(agent 据此分支,别解析 error 文本):`DEVICE_NOT_FOUND`、`USB_ACCESS`、`LOADER_MISSING`、`LOADER_REJECTED`、`PARTITION_NOT_FOUND`、`FILE_TOO_LARGE`、`INPUT_ERROR`、`NEEDS_CONFIRM`、`VERIFY_FAILED`、`ALREADY_PATCHED`、`FIREHOSE_NAK`、`TIMEOUT`、`ERROR`。
+- `schema_version` 变更即契约变更。
+
+### 破坏性操作护栏(write / write-lun / erase / erase-lun)
+
+- **默认拒绝执行**,返回 `error_code:"NEEDS_CONFIRM"` + `details.impact`(目标 lun/扇区/字节数、`risk` 等级 high/medium/low)。agent 读 impact 判断后,加 `--yes` 才真正执行。
+- `--yes` 执行时:**自动先把原分区读出备份**(返回 `data.backup_path`,`--no-backup` 可关),写入后**自动回读校验**(返回 `data.verified` / `verified_all_zero`;超过 256MB 跳过校验返回 `null`)。校验不一致返回 `VERIFY_FAILED` 并提示用 backup_path 回滚。
+
+```sh
+qedl -l $L write boot_b boot_b.magisk.img            # 无 --yes:只返回影响评估,不写
+qedl -l $L write boot_b boot_b.magisk.img --yes      # 真写:自动备份+写+回读校验
+```
+
 ## 本地 boot 镜像处理(集成 magiskboot 功能,不碰设备)
 
 把 magiskboot 的核心能力并进来了,配合 EDL 读写形成「读 boot → 改 → 写回」闭环,全程 Mac 原生:
