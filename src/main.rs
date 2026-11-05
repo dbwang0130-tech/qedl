@@ -6,6 +6,7 @@
 mod bootimg;
 mod compress;
 mod cpio;
+mod magisk;
 mod firehose;
 mod gpt;
 mod sahara;
@@ -125,6 +126,44 @@ enum Cmd {
     Boot {
         #[command(subcommand)]
         sub: BootCmd,
+    },
+    /// 本地 Magisk 修补(从 Magisk apk 取资源注入 boot,不碰设备)
+    Magisk {
+        #[command(subcommand)]
+        sub: MagiskCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MagiskCmd {
+    /// 读 Magisk apk 的版本与可用架构
+    Info { apk: String },
+    /// 从 apk 解出某架构的 native 资源(magiskinit + xz 资源)到目录
+    Extract {
+        apk: String,
+        outdir: String,
+        #[arg(long, default_value = "arm64")]
+        arch: String,
+    },
+    /// 用 apk 给 boot 打 Magisk 补丁(本地,不碰设备)
+    Patch {
+        /// 原厂 boot 镜像
+        boot: String,
+        /// Magisk apk
+        apk: String,
+        /// 输出的已修补 boot
+        out: String,
+        #[arg(long, default_value = "arm64")]
+        arch: String,
+        /// 关闭 KEEPVERITY(默认保留 AVB/dm-verity)
+        #[arg(long)]
+        no_keepverity: bool,
+        /// 关闭 KEEPFORCEENCRYPT(默认保持强制加密)
+        #[arg(long)]
+        no_keepforceencrypt: bool,
+        /// 安装到 recovery(RECOVERYMODE=true)
+        #[arg(long)]
+        recovery: bool,
     },
 }
 
@@ -497,6 +536,64 @@ fn run(cli: &Cli) -> Result<Value> {
         }
 
         Cmd::Boot { sub } => run_boot(sub, cli.json),
+
+        Cmd::Magisk { sub } => run_magisk(sub),
+    }
+}
+
+fn run_magisk(sub: &MagiskCmd) -> Result<Value> {
+    match sub {
+        MagiskCmd::Info { apk } => {
+            let mut a = magisk::open_apk(apk)?;
+            let (ver, code) = magisk::version(&mut a);
+            let archs = magisk::list_archs(&mut a);
+            log!("Magisk {} (code {}) archs={}", ver.clone().unwrap_or("?".into()), code.clone().unwrap_or("?".into()), archs.join(","));
+            Ok(json!({"ok": true, "version": ver, "version_code": code, "archs": archs}))
+        }
+        MagiskCmd::Extract { apk, outdir, arch } => {
+            let mut a = magisk::open_apk(apk)?;
+            let res = magisk::extract(&mut a, arch)?;
+            let dir = std::path::Path::new(outdir);
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(dir.join("magiskinit"), &res.magiskinit)?;
+            std::fs::write(dir.join("magisk.xz"), &res.magisk_xz)?;
+            if let Some(s) = &res.stub_xz {
+                std::fs::write(dir.join("stub.xz"), s)?;
+            }
+            if let Some(i) = &res.initld_xz {
+                std::fs::write(dir.join("init-ld.xz"), i)?;
+            }
+            log!("解出到 {outdir}/(abi={}, magiskinit {} 字节, magisk.xz {} 字节)", res.arch, res.magiskinit.len(), res.magisk_xz.len());
+            Ok(json!({
+                "ok": true, "outdir": outdir, "abi": res.arch,
+                "magiskinit": res.magiskinit.len(), "magisk_xz": res.magisk_xz.len(),
+                "stub_xz": res.stub_xz.as_ref().map(|v| v.len()),
+                "init_ld_xz": res.initld_xz.as_ref().map(|v| v.len()),
+            }))
+        }
+        MagiskCmd::Patch { boot, apk, out, arch, no_keepverity, no_keepforceencrypt, recovery } => {
+            let boot_data = std::fs::read(boot).with_context(|| format!("读取 {boot} 失败"))?;
+            let mut a = magisk::open_apk(apk)?;
+            let (ver, _) = magisk::version(&mut a);
+            let res = magisk::extract(&mut a, arch)?;
+            let opts = magisk::PatchOpts {
+                keep_verity: !no_keepverity,
+                keep_forceencrypt: !no_keepforceencrypt,
+                recovery: *recovery,
+            };
+            log!(
+                "用 Magisk {} (abi {}) 修补 {boot} → {out} [KEEPVERITY={} KEEPFORCEENCRYPT={} RECOVERYMODE={}]",
+                ver.clone().unwrap_or("?".into()), res.arch, opts.keep_verity, opts.keep_forceencrypt, opts.recovery
+            );
+            let patched = magisk::patch(&boot_data, &res, &opts)?;
+            std::fs::write(out, &patched).with_context(|| format!("写入 {out} 失败"))?;
+            log!("完成: {out}({} 字节)。刷回前务必先备份原 boot!", patched.len());
+            Ok(json!({
+                "ok": true, "out": out, "bytes": patched.len(),
+                "magisk_version": ver, "abi": res.arch,
+                "keep_verity": opts.keep_verity, "keep_forceencrypt": opts.keep_forceencrypt, "recovery": opts.recovery,
+            }))
+        }
     }
 }
 

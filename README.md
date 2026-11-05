@@ -63,6 +63,28 @@ qedl boot repack ud boot.new.img               # 重打包(ramdisk 按原格式�
   qedl -l $L write boot_b boot_b.new.img  # EDL 写回
   ```
 
+## 本地 Magisk 修补(独立命令,不碰设备)
+
+从 Magisk apk 取 native 资源、按现代 Magisk 流程注入 boot ramdisk。**拆成独立命令,不串 EDL**(读写用上面的 `read`/`write` 自己接):
+
+```sh
+qedl magisk info  Magisk.apk                      # 看版本与可用架构
+qedl magisk extract Magisk.apk res --arch arm64   # 解出 magiskinit + magisk/stub/init-ld.xz
+qedl magisk patch boot.img Magisk.apk boot.new.img --arch arm64   # 本地打补丁
+    # 选项:--no-keepverity / --no-keepforceencrypt / --recovery
+```
+
+典型流程(独立几步,自己组合):
+```sh
+qedl -l $L read boot_b boot_b.img                 # ① EDL 读原厂 boot
+qedl magisk patch boot_b.img Magisk.apk boot_b.magisk.img --arch arm64   # ② 本地打补丁
+qedl -l $L write boot_b boot_b.magisk.img         # ③ EDL 写回(务必先备份原 boot!)
+```
+
+- 注入序列对齐高通工具箱 `imgkit.bat` 验证过的现代分支(26000–28100):`init←magiskinit`、`overlay.d/sbin/{magisk,stub,init-ld}.xz`、`.backup/.magisk` config(KEEPVERITY/KEEPFORCEENCRYPT/RECOVERYMODE/SHA1)。
+- **未复刻**:cpio `patch`(verity/forceencrypt 默认 true 时基本 no-op)、`backup`(仅供 Magisk 卸载还原)、kernel hexpatch(三星/vivo 等设备特定)、各老版本(<25000)分支差异。
+- 已验证:Magisk v28.1 对 S2 boot_b 打补丁,解包回来注入结构/config/SHA1 全部正确;**但未真机刷机验证能否开机**,刷前务必备份。
+
 ## 进 9008
 
 关机 → 按住音量上+下 → 插线(黑屏正常)。PBL 若迟迟收不到 firehose 会超时自动重启,所以检测到后要立刻上传。
