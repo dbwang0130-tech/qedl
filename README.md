@@ -16,8 +16,10 @@ cargo build --release
 
 全局选项:`--loader <path>`(除 detect/info 外必需)、`--memory ufs|emmc`、`--sector-size N`、`--max-payload N`、`--vid/--pid`(hex)、`--wait <秒>`(轮询等待设备,PBL 会超时重启所以别设太大)、`--json`。
 
+loader 已随仓库备份在 `loaders/`(见 `loaders/README.md`),S2 用 `devprg_665_mi_noauth`。
+
 ```sh
-L=/path/to/devprg_665            # firehose loader(需设备接受的签名版)
+L=loaders/devprg_665_mi_noauth   # firehose loader(已验证,随仓库自带)
 
 qedl detect                       # 只看 9008 是否在线
 qedl info                         # sahara 命令模式读 serial/hwid/pkhash(刚进 9008 时)
