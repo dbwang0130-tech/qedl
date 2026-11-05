@@ -1,0 +1,45 @@
+name: release
+
+# 推送 v* tag 时,在 Intel + Apple Silicon 两个 macOS runner 各自原生编译,
+# 把 qedl 二进制打包上传到对应的 GitHub Release。公开仓库用标准 runner 免费。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14   # Apple Silicon
+            arch: aarch64
+          - runner: macos-13   # Intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: cargo --version && rustc --version
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          cd target/release
+          tar czf qedl-${{ matrix.arch }}-apple-darwin.tar.gz qedl
+          shasum -a 256 qedl-${{ matrix.arch }}-apple-darwin.tar.gz > qedl-${{ matrix.arch }}-apple-darwin.tar.gz.sha256
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/qedl-${{ matrix.arch }}-apple-darwin.tar.gz
+            target/release/qedl-${{ matrix.arch }}-apple-darwin.tar.gz.sha256
