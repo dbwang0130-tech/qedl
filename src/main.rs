@@ -3,6 +3,9 @@
 //! 面向 agent:每条命令可用 `--json` 输出单个 JSON 对象到 stdout;
 //! 人类可读日志统一走 stderr;退出码 0=成功,1=失败。
 
+mod bootimg;
+mod compress;
+mod cpio;
 mod firehose;
 mod gpt;
 mod sahara;
@@ -117,6 +120,65 @@ enum Cmd {
     Reset {
         #[arg(default_value = "reset")]
         mode: String,
+    },
+    /// 本地 boot 镜像处理(magiskboot 功能,不碰设备)
+    Boot {
+        #[command(subcommand)]
+        sub: BootCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BootCmd {
+    /// 打印 boot 镜像头信息
+    Info { img: String },
+    /// 解包:分离 kernel/ramdisk(解压成 cpio)/dtb 等到目录
+    Unpack {
+        img: String,
+        /// 输出目录,默认 <img>.unpacked
+        outdir: Option<String>,
+    },
+    /// 重打包:从 unpack 目录重建镜像
+    Repack {
+        dir: String,
+        out: String,
+    },
+    /// cpio 操作(修改 ramdisk.cpio,原地写回)
+    Cpio {
+        #[command(subcommand)]
+        sub: CpioCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CpioCmd {
+    /// 列出条目
+    Ls { file: String },
+    /// 提取:给 entry+out 提取单个,否则全部解到目录
+    Extract {
+        file: String,
+        entry: Option<String>,
+        out: Option<String>,
+    },
+    /// 添加文件(mode 为八进制,如 0644)
+    Add {
+        file: String,
+        mode: String,
+        entry: String,
+        infile: String,
+    },
+    /// 删除条目
+    Rm {
+        file: String,
+        entry: String,
+        #[arg(short, long)]
+        recursive: bool,
+    },
+    /// 新建目录(mode 八进制)
+    Mkdir {
+        file: String,
+        mode: String,
+        entry: String,
     },
 }
 
@@ -433,7 +495,184 @@ fn run(cli: &Cli) -> Result<Value> {
             fh.reset(mode)?;
             Ok(json!({"ok": true, "mode": mode}))
         }
+
+        Cmd::Boot { sub } => run_boot(sub, cli.json),
     }
+}
+
+fn run_boot(sub: &BootCmd, json_mode: bool) -> Result<Value> {
+    match sub {
+        BootCmd::Info { img } => {
+            let data = std::fs::read(img).with_context(|| format!("读取 {img} 失败"))?;
+            let b = bootimg::BootImg::parse(&data)?;
+            let cmdline = read_cmdline(&b);
+            log!(
+                "version={} page_size={} kernel={} ramdisk={}({}) second={} dtb={}",
+                b.version,
+                b.page_size,
+                b.kernel.len(),
+                b.ramdisk_raw.len(),
+                b.ramdisk_fmt.name(),
+                b.second.len(),
+                b.dtb.len()
+            );
+            Ok(json!({
+                "ok": true,
+                "version": b.version,
+                "page_size": b.page_size,
+                "kernel_size": b.kernel.len(),
+                "ramdisk_size": b.ramdisk_raw.len(),
+                "ramdisk_format": b.ramdisk_fmt.name(),
+                "ramdisk_uncompressed": b.ramdisk.len(),
+                "second_size": b.second.len(),
+                "recovery_dtbo_size": b.recovery_dtbo.len(),
+                "dtb_size": b.dtb.len(),
+                "cmdline": cmdline,
+            }))
+        }
+
+        BootCmd::Unpack { img, outdir } => {
+            let data = std::fs::read(img).with_context(|| format!("读取 {img} 失败"))?;
+            let b = bootimg::BootImg::parse(&data)?;
+            let dir = outdir.clone().unwrap_or_else(|| format!("{img}.unpacked"));
+            b.unpack_to(std::path::Path::new(&dir))?;
+            log!(
+                "解包到 {dir}/(kernel {} 字节, ramdisk {} 字节/{}, 解压后 cpio {} 字节)",
+                b.kernel.len(),
+                b.ramdisk_raw.len(),
+                b.ramdisk_fmt.name(),
+                b.ramdisk.len()
+            );
+            Ok(json!({
+                "ok": true, "outdir": dir, "version": b.version,
+                "ramdisk_format": b.ramdisk_fmt.name(),
+                "files": ["header.bin","ramdisk_fmt","kernel","ramdisk.cpio"],
+            }))
+        }
+
+        BootCmd::Repack { dir, out } => {
+            let img = bootimg::repack_from_dir(std::path::Path::new(dir))?;
+            std::fs::write(out, &img).with_context(|| format!("写入 {out} 失败"))?;
+            log!("重打包完成: {out}({} 字节)", img.len());
+            Ok(json!({"ok": true, "out": out, "bytes": img.len()}))
+        }
+
+        BootCmd::Cpio { sub } => run_cpio(sub, json_mode),
+    }
+}
+
+fn run_cpio(sub: &CpioCmd, _json_mode: bool) -> Result<Value> {
+    match sub {
+        CpioCmd::Ls { file } => {
+            let data = std::fs::read(file).with_context(|| format!("读取 {file} 失败"))?;
+            let c = cpio::Cpio::parse(&data)?;
+            let mut list = Vec::new();
+            for (name, e) in &c.entries {
+                let tc = cpio::type_char(e.mode);
+                let perm = e.mode & 0o7777;
+                let target = if e.mode & cpio::S_IFMT == cpio::S_IFLNK {
+                    String::from_utf8_lossy(&e.data).into_owned()
+                } else {
+                    String::new()
+                };
+                log!(
+                    "{}{:04o} {:>8} {}{}",
+                    tc,
+                    perm,
+                    e.data.len(),
+                    name,
+                    if target.is_empty() { String::new() } else { format!(" -> {target}") }
+                );
+                list.push(json!({
+                    "name": name, "type": tc.to_string(), "mode": format!("{:04o}", perm),
+                    "size": e.data.len(), "symlink": target,
+                }));
+            }
+            Ok(json!({"ok": true, "count": list.len(), "entries": list}))
+        }
+
+        CpioCmd::Extract { file, entry, out } => {
+            let data = std::fs::read(file).with_context(|| format!("读取 {file} 失败"))?;
+            let c = cpio::Cpio::parse(&data)?;
+            match (entry, out) {
+                (Some(e), Some(o)) => {
+                    let name = e.trim_start_matches('/');
+                    let ent = c
+                        .entries
+                        .get(name)
+                        .with_context(|| format!("cpio 内无条目 {name}"))?;
+                    std::fs::write(o, &ent.data)?;
+                    log!("提取 {name} -> {o}({} 字节)", ent.data.len());
+                    Ok(json!({"ok": true, "entry": name, "out": o, "bytes": ent.data.len()}))
+                }
+                _ => {
+                    let dir = out.clone().unwrap_or_else(|| format!("{file}.extracted"));
+                    let base = std::path::Path::new(&dir);
+                    let mut n = 0;
+                    for (name, e) in &c.entries {
+                        if e.mode & cpio::S_IFMT == cpio::S_IFREG {
+                            let p = base.join(name);
+                            if let Some(parent) = p.parent() {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            std::fs::write(&p, &e.data)?;
+                            n += 1;
+                        }
+                    }
+                    log!("提取 {n} 个文件到 {dir}/");
+                    Ok(json!({"ok": true, "outdir": dir, "files": n}))
+                }
+            }
+        }
+
+        CpioCmd::Add { file, mode, entry, infile } => {
+            let data = std::fs::read(file).with_context(|| format!("读取 {file} 失败"))?;
+            let mut c = cpio::Cpio::parse(&data)?;
+            let m = parse_octal(mode)?;
+            let content = std::fs::read(infile).with_context(|| format!("读取 {infile} 失败"))?;
+            let sz = content.len();
+            c.add_file(m, entry, content);
+            std::fs::write(file, c.serialize())?;
+            log!("添加 {entry}(mode {mode}, {sz} 字节)写回 {file}");
+            Ok(json!({"ok": true, "entry": entry, "bytes": sz}))
+        }
+
+        CpioCmd::Rm { file, entry, recursive } => {
+            let data = std::fs::read(file).with_context(|| format!("读取 {file} 失败"))?;
+            let mut c = cpio::Cpio::parse(&data)?;
+            c.rm(entry, *recursive);
+            std::fs::write(file, c.serialize())?;
+            log!("删除 {entry}{}写回 {file}", if *recursive { "(递归)" } else { "" });
+            Ok(json!({"ok": true, "entry": entry}))
+        }
+
+        CpioCmd::Mkdir { file, mode, entry } => {
+            let data = std::fs::read(file).with_context(|| format!("读取 {file} 失败"))?;
+            let mut c = cpio::Cpio::parse(&data)?;
+            let m = parse_octal(mode)?;
+            c.mkdir(m, entry);
+            std::fs::write(file, c.serialize())?;
+            log!("新建目录 {entry}(mode {mode})写回 {file}");
+            Ok(json!({"ok": true, "entry": entry}))
+        }
+    }
+}
+
+/// 解析八进制 mode,接受 "0644"/"644"/"0o644"。
+fn parse_octal(s: &str) -> Result<u32> {
+    let t = s.trim().trim_start_matches("0o");
+    u32::from_str_radix(t, 8).with_context(|| format!("mode 需为八进制,如 0644,收到 {s}"))
+}
+
+/// 从 header 页读 cmdline(v0-2 @64/512, v3+ @44/1536)。
+fn read_cmdline(b: &bootimg::BootImg) -> String {
+    let (off, len) = if b.version >= 3 { (44usize, 1536usize) } else { (64usize, 512usize) };
+    if b.header_page.len() < off + len {
+        return String::new();
+    }
+    let raw = &b.header_page[off..off + len];
+    let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end]).into_owned()
 }
 
 fn human(bytes: u64) -> String {

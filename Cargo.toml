@@ -15,6 +15,11 @@ clap = { version = "4.5.20", features = ["derive"] }
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
 anyhow = "1.0.89"
+# boot 镜像处理(magiskboot 功能):纯 Rust,保持自包含
+flate2 = "1.0.34"          # gzip
+lz4_flex = "0.11.3"        # lz4 frame
+lzma-rs = "0.3.0"          # xz / lzma(纯 rust)
+sha1 = "0.10.6"            # boot id
 
 [profile.release]
 opt-level = 3
