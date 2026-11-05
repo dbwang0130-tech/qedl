@@ -1,0 +1,22 @@
+[package]
+name = "qedl"
+version = "0.1.0"
+edition = "2021"
+description = "Qualcomm 9008 EDL (Sahara + Firehose) tool, native macOS binary, agent-friendly"
+license = "GPL-3.0"
+
+[[bin]]
+name = "qedl"
+path = "src/main.rs"
+
+[dependencies]
+rusb = "0.9.4"
+clap = { version = "4.5.20", features = ["derive"] }
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+anyhow = "1.0.89"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
